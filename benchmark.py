@@ -10,7 +10,7 @@ from tqdm import tqdm
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 import torch.distributed as dist
-
+import json
 from deepspeed.accelerator import get_accelerator
 
 try:
@@ -48,10 +48,6 @@ MODEL_CONFIGS = {
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--model', default="7b", type=str, help="model type")
-    parser.add_argument('-b', '--batch-size', default=32, type=int,
-                    help='mini-batch size (default: 256), this is the total '
-                         'batch size of all GPUs on the current node when '
-                         'using Data Parallel or Distributed Data Parallel')
     parser.add_argument("-s", "--num_steps", type=int, default=5, help="Number of steps to run")
     parser.add_argument("-i", "--ignore_steps", type=int, default=2, help="Number of steps to ignore")
     parser.add_argument("-g", "--grad_checkpoint", action="store_true", help="Use gradient checkpointing")
@@ -71,6 +67,12 @@ def main():
     # ==============================
     args = parse_args()
     deepspeed.init_distributed()
+    print("initialized distributed")
+
+    # get config
+    with open(args.deepspeed_config, 'r') as f:
+        ds_config = json.load(f)
+    batch_size_per_gpu = ds_config['train_micro_batch_size_per_gpu']
 
     # ==============================
     # Initialize Dataset and Dataloader
@@ -78,20 +80,27 @@ def main():
     dp_size = dist.get_world_size()
     config = MODEL_CONFIGS[args.model]
     dataset = RandomDataset(
-        num_samples=args.batch_size * args.num_steps * dp_size, max_length=args.max_length, vocab_size=config.vocab_size
+        num_samples=batch_size_per_gpu * args.num_steps * dp_size, max_length=args.max_length, vocab_size=config.vocab_size
     )
     sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size,
+        dataset, batch_size=batch_size_per_gpu,
         num_workers=8, pin_memory=True, sampler=sampler)
+    print("built dataloader")
 
     # ==============================
     # Initialize Model and Optimizer
     # ==============================
-    model = LlamaForCausalLM(config)
+    with deepspeed.zero.Init(remote_device=None,
+                             config_dict_or_path=args.deepspeed_config,
+                             enabled=ds_config['zero_optimization']['stage'] == 3
+                             ):
+        model = LlamaForCausalLM(config)
+    print("built model")
 
     if args.grad_checkpoint:
         model.gradient_checkpointing_enable()
+        print("enabled gradient checkpointing")
 
     # if args.xformers:
     #     assert SUPPORT_FLASH, "Use flash attention while xfomers is not installed"
@@ -104,23 +113,23 @@ def main():
         args=args,
         model=model,
         )
+    print("initialized deepspeed")
 
-    model_numel = get_model_numel(model)
-    print(f"Model params: {format_numel_str(model_numel)}")
-    # performance_evaluator = PerformanceEvaluator(
-    #     model_numel,
-    #     model.config.num_hidden_layers,
-    #     model.config.hidden_size,
-    #     model.config.vocab_size,
-    #     args.grad_checkpoint,
-    #     args.ignore_steps,
-    #     dp_world_size=dp_size,
-    # )
+    model_numel = sum(p.numel() for p in model_engine.module.parameters())
+    performance_evaluator = PerformanceEvaluator(
+        model_numel=model_numel,
+        num_layers=model.config.num_hidden_layers,
+        hidden_size=model.config.hidden_size,
+        vocab_size=model.config.vocab_size,
+        dp_world_size=dp_size,
+        enable_grad_checkpoint=args.grad_checkpoint,
+        ignore_steps=args.ignore_steps,
+    )
 
 
     for step, data in tqdm(enumerate(dataloader), desc="Step", disable=dist.get_rank() != 0):
-        # performance_evaluator.on_step_start(step)
-
+        performance_evaluator.on_step_start(step)
+        model_engine.zero_grad()
         data = {
             k: v.to(get_accelerator().current_device())
             for k, v in data.items()
@@ -129,10 +138,11 @@ def main():
         loss = outputs[0]
         model_engine.backward(loss)
         model_engine.step()
-        # performance_evaluator.on_step_end(input_ids=torch.empty(args.batch_size, args.max_length))
+        
+        performance_evaluator.on_step_end(input_ids=torch.empty(batch_size_per_gpu, args.max_length))
 
-    # performance_evaluator.on_fit_end()
-    print(f"Max CUDA memory usage: {torch.cuda.max_memory_allocated()/1024**2:.2f} MB")
+    performance_evaluator.on_fit_end()
+    print(f"Max CUDA memory usage: {get_accelerator().max_memory_allocated()/1024**2:.2f} MB")
 
 
 if __name__ == "__main__":

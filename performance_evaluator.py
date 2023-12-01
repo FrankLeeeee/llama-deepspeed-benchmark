@@ -4,7 +4,15 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch import Tensor
+import deepspeed
+from deepspeed.accelerator import get_accelerator
 
+
+try:
+    import torch_npu
+    import deepspeed_npu
+except:
+    pass
 
 def divide(x: float, y: float) -> float:
     if y == 0:
@@ -18,7 +26,7 @@ def divide(x: float, y: float) -> float:
 def all_reduce_mean(x: float, world_size: int) -> float:
     if world_size == 1:
         return x
-    tensor = torch.tensor([x], device=x.device)
+    tensor = torch.tensor([x], device=get_accelerator().current_device())
     dist.all_reduce(tensor)
     tensor = tensor / world_size
     return tensor.item()
@@ -59,9 +67,9 @@ class PerformanceEvaluator:
         num_layers: int,
         hidden_size: int,
         vocab_size: int,
+        dp_world_size: int,
         enable_grad_checkpoint: bool = False,
         ignore_steps: int = 0,
-        dp_world_size: Optional[int] = None,
     ) -> None:
         self.model_numel = model_numel
         self.enable_grad_checkpoint = enable_grad_checkpoint
@@ -70,8 +78,7 @@ class PerformanceEvaluator:
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
 
-        self.coordinator = DistCoordinator()
-        self.dp_world_size = dp_world_size or self.coordinator.world_size
+        self.dp_world_size = dp_world_size
         self.disable: bool = False
         self.timer = Timer()
         self.num_samples: int = 0
@@ -82,13 +89,13 @@ class PerformanceEvaluator:
         self.disable = self.ignore_steps > 0 and step < self.ignore_steps
         if self.disable:
             return
-        device_utils.synchronize()
+        get_accelerator().synchronize()
         self.timer.start()
 
     def on_step_end(self, input_ids: Tensor, **kwargs) -> None:
         if self.disable:
             return
-        device_utils.synchronize()
+        get_accelerator().synchronize()
         self.timer.end()
 
         batch_size, seq_len = input_ids.shape
@@ -103,15 +110,13 @@ class PerformanceEvaluator:
         self.flop += batch_size * seq_len * self.model_numel * 2 * (3 + int(self.enable_grad_checkpoint))
 
     def on_fit_end(self) -> None:
-        avg_duration = all_reduce_mean(self.timer.duration, self.coordinator.world_size)
+
+        avg_duration = all_reduce_mean(self.timer.duration, self.dp_world_size)
         avg_throughput = self.num_samples * self.dp_world_size / (avg_duration + 1e-12)
-        mp_world_size = self.coordinator.world_size // self.dp_world_size
-        avg_tflops_per_gpu_megatron = self.flop_megatron / 1e12 / (avg_duration + 1e-12) / mp_world_size
-        avg_tflops_per_gpu = self.flop / 1e12 / (avg_duration + 1e-12) / mp_world_size
-        self.coordinator.print_on_master(
-            f"num_samples: {self.num_samples}, dp_world_size: {self.dp_world_size}, flop_megatron: {self.flop_megatron}, flop: {self.flop}, avg_duration: {avg_duration}, "
-            f"avg_throughput: {avg_throughput}"
+        avg_tflops_per_gpu = self.flop / 1e12 / (avg_duration + 1e-12)
+        print(
+            f"num_samples: {self.num_samples}, dp_world_size: {self.dp_world_size}, flop: {self.flop}, avg_duration: {avg_duration}, "
         )
-        self.coordinator.print_on_master(
-            f"Throughput: {avg_throughput:.2f} samples/sec, TFLOPS per GPU by Megatron: {avg_tflops_per_gpu_megatron:.2f}, TFLOPS per GPU: {avg_tflops_per_gpu:.2f}"
+        print(
+            f"Throughput: {avg_throughput:.2f} samples/sec, TFLOPS per GPU: {avg_tflops_per_gpu:.2f}"
         )
